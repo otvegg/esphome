@@ -1,0 +1,445 @@
+esphome:
+  name: esp32-screensensor
+  friendly_name: "ESP32 Screen Sensor Statiob"
+  # GPIO2 has an onboard pull-up (needed for boot-mode strapping) and this
+  # board's onboard blue LED lights whenever GPIO2 is high, so it's lit at
+  # idle even with nothing wired to it. Safe to drive low once boot has
+  # already happened - strapping only matters during reset, not at runtime.
+  on_boot:
+    priority: -100
+    then:
+      - output.turn_off: onboard_led
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+# Enables logging over the serial console (and, once connected, over WiFi).
+logger:
+
+# Native Home Assistant API - this is what makes Home Assistant auto-discover
+# the device via mDNS once it's on the network (Settings > Devices & Services).
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+# Lets you push firmware updates over WiFi after the first serial flash.
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Falls back to a hotspot named like "Esp32-Screensensor Fallback" if it
+  # can't join the configured WiFi - connect to that to reconfigure.
+  ap:
+    ssid: "ESP32 Screensensor Fallback"
+
+# ESPHome has no built-in driver for the WeAct 3.7" panel (UC8253 controller) -
+# see components/uc8253_epaper/ for a custom one ported from GxEPD2.
+external_components:
+  - source:
+      type: local
+      path: components
+
+output:
+  - platform: gpio
+    pin: GPIO2
+    id: onboard_led
+
+spi:
+  clk_pin: GPIO18   # moved off GPIO22 to free it for I2C
+  mosi_pin: GPIO23  # moved off GPIO21 to free it for I2C
+
+i2c:
+  # GPIO21/22 - moved here from GPIO27/26 because the same AHT20+BMP280
+  # module works reliably on these exact pins in another project
+  # (esp32-oled-demo), while 27/26 consistently failed deeper I2C reads on
+  # this board despite scanning fine.
+  sda: GPIO21
+  scl: GPIO22
+  scan: true  # logs detected addresses at boot - handy if the sensors don't show up
+
+# Needed for the midnight reset of the load-cell counters below. Assuming
+# Europe/Oslo based on context (Norwegian wifi network name, .no email
+# domain) - change this if that's wrong.
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Oslo
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lambda: |-
+              id(cell1_above_count) = 0;
+              id(cell2_above_count) = 0;
+              id(min_temp_today) = 100.0;
+              id(max_temp_today) = -100.0;
+
+globals:
+  - id: cell1_above_count
+    type: int
+    restore_value: true
+    initial_value: '0'
+  - id: cell2_above_count
+    type: int
+    restore_value: true
+    initial_value: '0'
+  # Sentinels chosen so the first real reading of the day immediately
+  # overwrites them in the right direction - no real temperature reads
+  # anywhere near +-100 C.
+  - id: min_temp_today
+    type: float
+    restore_value: true
+    initial_value: '100.0'
+  - id: max_temp_today
+    type: float
+    restore_value: true
+    initial_value: '-100.0'
+  # millis() timestamp of the last value received from Home Assistant (any
+  # of the push-based sensors below) - used to show a staleness warning if
+  # the API connection or HA itself has gone quiet.
+  - id: last_ha_update_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # Set once the "frozen for the night" notice has been drawn for the
+  # current quiet-hours window, so we only draw it (and physically refresh)
+  # once at the quiet-hours-start boundary, then freeze - not on every 60s
+  # tick until quiet hours end. Reset back to false the moment they end.
+  - id: night_notice_drawn
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+  # millis() timestamp of the last time the display actually redrew (as
+  # opposed to every 60s poll tick) - used to throttle real redraws to the
+  # user-configurable update_interval_minutes below.
+  - id: last_draw_ms
+    type: uint32_t
+    restore_value: false
+    initial_value: '0'
+  # False until the very first draw after boot, so that first draw always
+  # happens immediately instead of waiting out a stale last_draw_ms=0
+  # comparison against update_interval_minutes.
+  - id: first_draw_done
+    type: bool
+    restore_value: false
+    initial_value: 'false'
+
+font:
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: bold
+    id: font1
+    size: 20
+
+  - file:
+      type: gfonts
+      family: Roboto
+      weight: bold
+    id: font2
+    size: 16
+
+sensor:
+  - platform: homeassistant
+    id: my_sensor
+    entity_id: sensor.kitchen_esp32_weight_sensor_station_temperature
+    filters:
+      - delta: 0.5  # ignore fluctuations smaller than this - pairs with the
+                    # display's own skip-if-unchanged refresh logic to avoid
+                    # needless e-paper flicker for tiny temperature wobbles
+    on_value:
+      then:
+        - lambda: |-
+            id(last_ha_update_ms) = millis();
+            if (x < id(min_temp_today)) id(min_temp_today) = x;
+            if (x > id(max_temp_today)) id(max_temp_today) = x;
+
+  # Met.no/Yr.no forecast, via HA's built-in Met.no integration.
+  - platform: homeassistant
+    id: outdoor_temp
+    entity_id: weather.forecast_home
+    attribute: temperature
+    on_value:
+      then:
+        - lambda: id(last_ha_update_ms) = millis();
+
+  - platform: wifi_signal
+    id: wifi_db
+    update_interval: 60s
+
+  # From the HA-side template sensors that call weather.get_forecasts - see
+  # the packages/forecast template you added to Home Assistant. Confirm
+  # these entity_ids match what HA actually assigned before flashing.
+  - platform: homeassistant
+    id: forecast_day_1_temp
+    entity_id: sensor.forecast_day_1_temperature
+  - platform: homeassistant
+    id: forecast_day_2_temp
+    entity_id: sensor.forecast_day_2_temperature
+  - platform: homeassistant
+    id: forecast_day_3_temp
+    entity_id: sensor.forecast_day_3_temperature
+
+  # Locally-wired AHT20 (temp/humidity) + BMP280 (temp/pressure) combo board.
+  - platform: aht10
+    variant: AHT20
+    update_interval: 60s
+    temperature:
+      name: "AHT20 Temperature"
+      id: aht20_temperature
+    humidity:
+      name: "AHT20 Humidity"
+      id: aht20_humidity
+
+  - platform: bmp280_i2c
+    address: 0x77  # confirmed via i2c bus scan log - this board uses 0x77, not the more common 0x76
+    update_interval: 60s
+    temperature:
+      name: "BMP280 Temperature"
+      id: bmp280_temperature
+    pressure:
+      name: "BMP280 Pressure"
+      id: bmp280_pressure
+
+
+  # Raw load cell readings, pulled just to detect threshold crossings below -
+  # not shown on screen directly, only the daily above-500g counts are.
+  - platform: homeassistant
+    id: cell1_weight
+    entity_id: sensor.kitchen_esp32_weight_sensor_station_load_cell_1
+    on_value:
+      then:
+        - lambda: |-
+            id(last_ha_update_ms) = millis();
+            // static: persists between calls, tracks the previous reading so
+            // we count each rising edge through 500g once, not every sample
+            // that happens to be above it.
+            static bool was_above = false;
+            if (x >= 500.0 && !was_above) {
+              id(cell1_above_count) += 1;
+            }
+            was_above = (x >= 500.0);
+
+  - platform: homeassistant
+    id: cell2_weight
+    entity_id: sensor.kitchen_esp32_weight_sensor_station_load_cell_2
+    on_value:
+      then:
+        - lambda: |-
+            id(last_ha_update_ms) = millis();
+            static bool was_above = false;
+            if (x >= 500.0 && !was_above) {
+              id(cell2_above_count) += 1;
+            }
+            was_above = (x >= 500.0);
+
+text_sensor:
+  - platform: homeassistant
+    id: outdoor_condition
+    entity_id: weather.forecast_home
+
+  - platform: uptime
+    id: uptime_human
+
+  - platform: homeassistant
+    id: forecast_day_1_condition
+    entity_id: sensor.forecast_day_1_condition
+  - platform: homeassistant
+    id: forecast_day_2_condition
+    entity_id: sensor.forecast_day_2_condition
+  - platform: homeassistant
+    id: forecast_day_3_condition
+    entity_id: sensor.forecast_day_3_condition
+
+graph:
+  - id: temp_graph
+    sensor: my_sensor
+    duration: 8h
+    width: 200
+    height: 70
+    x_grid: 1h
+
+# Settings adjustable from Home Assistant without re-flashing. All three are
+# pure "template" entities (no lambda/set_action) so HA's set command is the
+# only thing that ever changes them; restore_value keeps the chosen values
+# across reboots, entity_category tucks them under the device's
+# Configuration section in HA instead of the main entity list.
+number:
+  - platform: template
+    name: "Update Interval"
+    id: update_interval_minutes
+    min_value: 1
+    max_value: 30
+    step: 1
+    initial_value: 5
+    restore_value: true
+    optimistic: true
+    unit_of_measurement: min
+    icon: mdi:timer-outline
+    entity_category: config
+
+datetime:
+  - platform: template
+    type: time
+    name: "Quiet Hours Start"
+    id: quiet_hours_start
+    initial_value: "02:00:00"
+    restore_value: true
+    optimistic: true
+    entity_category: config
+  - platform: template
+    type: time
+    name: "Quiet Hours End"
+    id: quiet_hours_end
+    initial_value: "05:30:00"
+    restore_value: true
+    optimistic: true
+    entity_category: config
+
+display:
+  - platform: uc8253_epaper
+    cs_pin: GPIO19  # moved off GPIO2 - that's wired to the board's onboard blue LED
+    dc_pin: GPIO17
+    busy_pin: GPIO4
+    reset_pin: GPIO16
+    update_interval: 60s
+    rotation: 90  # 0, 90, 180, or 270 - swaps width/height for 90/270
+    # Disabled so we can skip drawing entirely during quiet hours (see the
+    # Quiet Hours Start/End datetime entities below) and leave the
+    # framebuffer exactly as it was - the unchanged-buffer check in update()
+    # then skips the physical (flickery) refresh too. The sensor and graph
+    # data keep updating in the background regardless, so the display comes
+    # back with a fully caught-up graph once quiet hours end.
+    auto_clear_enabled: false
+    lambda: |-
+      auto now = id(sntp_time).now();
+      bool quiet_hours = false;
+      if (now.is_valid()) {
+        const int minutes_since_midnight = now.hour * 60 + now.minute;
+        const int start_min = id(quiet_hours_start).hour() * 60 + id(quiet_hours_start).minute();
+        const int end_min = id(quiet_hours_end).hour() * 60 + id(quiet_hours_end).minute();
+        // Handles a window that crosses midnight (e.g. 23:00 -> 06:00) as
+        // well as one that doesn't (e.g. 02:00 -> 05:30) - both are
+        // reasonable choices once this is user-configurable from HA.
+        quiet_hours = start_min <= end_min ? (minutes_since_midnight >= start_min && minutes_since_midnight < end_min)
+                                            : (minutes_since_midnight >= start_min || minutes_since_midnight < end_min);
+      }
+
+      if (quiet_hours) {
+        if (id(night_notice_drawn)) {
+          // Already drew tonight's "frozen" frame below - stay frozen (no
+          // draw at all means the buffer is byte-identical to last time,
+          // which makes update()'s unchanged-buffer check skip the physical
+          // refresh too, so nothing flashes overnight).
+          return;
+        }
+        id(night_notice_drawn) = true;
+        // Fall through and draw one last time tonight - the quiet-hours
+        // notice added near the bottom will make it obvious this frame is
+        // about to freeze, not that HA/sensors have gone stale.
+      } else {
+        id(night_notice_drawn) = false;  // armed again for the next quiet-hours window
+
+        // Outside quiet hours, only actually redraw as often as the
+        // "Update Interval" number entity says (set from HA) - same
+        // frozen-buffer trick as quiet hours, just on a shorter, adjustable
+        // cycle instead of a fixed 60s. first_draw_done bypasses this once,
+        // right after boot, so the panel doesn't sit blank for a whole
+        // interval before its first real draw.
+        const uint32_t desired_interval_ms = (uint32_t) id(update_interval_minutes).state * 60000UL;
+        if (id(first_draw_done) && millis() - id(last_draw_ms) < desired_interval_ms) {
+          return;
+        }
+      }
+
+      id(first_draw_done) = true;
+      id(last_draw_ms) = millis();
+
+      // auto_clear_enabled is off (see above), so we clear manually here -
+      // Color::BLACK is what actually renders as "blank" on this panel, per
+      // the is_on()-decides-ink-vs-blank note below.
+      it.fill(Color::BLACK);
+
+      // Outer border around the whole panel.
+      it.rectangle(0, 0, it.get_width(), it.get_height());
+
+      // Header: uptime (left), title (center), WiFi signal bars (right) -
+      // all sharing one row, no extra vertical space needed.
+      it.print(6, 8, id(font2), id(uptime_human).state.c_str());
+      it.print(it.get_width() / 2, 4, id(font1), TextAlign::TOP_CENTER, "Screensensor Station");
+      {
+        // 4-bar signal indicator instead of a raw dBm number - drawn with
+        // rectangles rather than relying on a font glyph for it.
+        const float rssi = id(wifi_db).state;
+        const int bars = rssi >= -50 ? 4 : rssi >= -60 ? 3 : rssi >= -70 ? 2 : rssi >= -80 ? 1 : 0;
+        const int heights[4] = {6, 10, 14, 18};
+        const int base_x = it.get_width() - 42;
+        const int baseline_y = 22;
+        for (int i = 0; i < 4; i++) {
+          const int bx = base_x + i * 9;
+          const int by = baseline_y - heights[i];
+          if (i < bars) {
+            it.filled_rectangle(bx, by, 6, heights[i]);
+          } else {
+            it.rectangle(bx, by, 6, heights[i]);
+          }
+        }
+      }
+      it.horizontal_line(4, 28, it.get_width() - 8);
+
+      // One line per sensor - Color argument left out on all draw calls:
+      // on this monochrome panel, Color::is_on() (not the RGB value) decides
+      // ink vs blank, so Color::BLACK renders invisible. Omitting it defaults
+      // to COLOR_ON, which is correct.
+      it.printf(10, 34, id(font2), "HA: %.1fC | mn %.1f | mx %.1f", id(my_sensor).state, id(min_temp_today), id(max_temp_today));
+      it.printf(10, 52, id(font2), "AHT20:    %.1f C  %.0f%% RH", id(aht20_temperature).state, id(aht20_humidity).state);
+      it.printf(10, 70, id(font2), "BMP280:   %.1f C  %.1f hPa", id(bmp280_temperature).state, id(bmp280_pressure).state);
+      it.printf(10, 88, id(font2), "Outdoor:  %s %.1f C", id(outdoor_condition).state.c_str(), id(outdoor_temp).state);
+
+      // Load cell threshold counts, separated from the sensor readings by a
+      // vertical divider. Each counts distinct crossings above 500g today,
+      // reset at local midnight.
+      it.vertical_line(255, 32, 74);
+      it.print(265, 34, id(font2), ">500g today:");
+      it.printf(265, 52, id(font2), "Cell1: %d", id(cell1_above_count));
+      it.printf(265, 70, id(font2), "Cell2: %d", id(cell2_above_count));
+      it.horizontal_line(4, 108, it.get_width() - 8);
+
+      // 3-day forecast, where the WiFi/uptime status line used to be -
+      // condition text is capped to 5 chars (%.5s) so a long condition
+      // string (e.g. "partlycloudy") can't blow out the line width.
+      it.printf(10, 114, id(font2), "1: %.0fC %.5s | 2: %.0fC %.5s | 3: %.0fC %.5s",
+                id(forecast_day_1_temp).state, id(forecast_day_1_condition).state.c_str(),
+                id(forecast_day_2_temp).state, id(forecast_day_2_condition).state.c_str(),
+                id(forecast_day_3_temp).state, id(forecast_day_3_condition).state.c_str());
+
+      // Staleness warning - only appears if nothing has arrived from Home
+      // Assistant in a while (catches HA being down or the API connection
+      // dropping silently).
+      const uint32_t ha_silent_for_ms = millis() - id(last_ha_update_ms);
+      if (ha_silent_for_ms > 5 * 60 * 1000UL) {
+        it.printf(10, 132, id(font2), "! No HA update in %u min", (unsigned) (ha_silent_for_ms / 60000UL));
+      }
+      it.horizontal_line(4, 150, it.get_width() - 8);
+
+      // Graph, boxed in its own border. No legend - it only ever plots one
+      // series, so a legend would just be clutter.
+      it.rectangle(9, 156, 202, 76);
+      it.graph(10, 157, id(temp_graph));
+
+      // Quiet-hours notice, drawn only on tonight's freezing frame (see the
+      // night_notice_drawn check above) - lives to the right of the graph,
+      // which only uses the left ~210px of this rotated panel's 416px width.
+      if (quiet_hours) {
+        it.filled_circle(240, 176, 12);
+        it.filled_circle(246, 172, 12, Color::BLACK);  // carves a crescent out of the circle above
+        it.print(225, 196, id(font2), "Quiet hours");
+        it.printf(225, 214, id(font2), "Frozen %02d:%02d", now.hour, now.minute);
+      }
