@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:esphome.io)",
+      "WebSearch",
+      "WebFetch(domain:community.home-assistant.io)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(curl -sL https://raw.githubusercontent.com/ZinggJM/GxEPD2/master/src/gdey/GxEPD2_370_GDEY037T03.h)"
+    ]
+  }
+}
