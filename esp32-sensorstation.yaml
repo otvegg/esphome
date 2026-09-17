@@ -1,0 +1,161 @@
+esphome:
+  name: esp32-sensorstation
+  friendly_name: "ESP32 Sensor Station"
+  # Re-zero both load cells on every boot, since a load cell's unloaded
+  # baseline drifts between power cycles (temperature, mechanical settling) -
+  # this mirrors the tare() call our old Arduino code did at every startup.
+  # This ESPHome version's hx711 component has no built-in tare, so we do it
+  # manually: average several fresh raw (pre-filter) samples at boot into a
+  # global (a single sample was too noisy - see below), then a lambda filter
+  # subtracts that offset before calibration runs. Uses non-blocking delay/
+  # repeat steps rather than delay() inside the lambda, to avoid stalling the
+  # main loop long enough to trip the watchdog.
+  on_boot:
+    priority: -100
+    then:
+      - delay: 3s
+      - lambda: |-
+          id(load_cell_1_offset) = 0;
+          id(load_cell_2_offset) = 0;
+          id(load_cell_1_samples) = 0;
+          id(load_cell_2_samples) = 0;
+      - repeat:
+          count: 8
+          then:
+            # Skip any NaN reading (e.g. HX711 not yet settled) - averaging
+            # one in with += would permanently poison the offset with NaN.
+            - lambda: |-
+                float raw1 = id(load_cell_1).get_raw_state();
+                if (!std::isnan(raw1)) {
+                  id(load_cell_1_offset) += raw1;
+                  id(load_cell_1_samples) += 1;
+                }
+                float raw2 = id(load_cell_2).get_raw_state();
+                if (!std::isnan(raw2)) {
+                  id(load_cell_2_offset) += raw2;
+                  id(load_cell_2_samples) += 1;
+                }
+            - delay: 250ms
+      - lambda: |-
+          if (id(load_cell_1_samples) > 0) {
+            id(load_cell_1_offset) /= id(load_cell_1_samples);
+          }
+          if (id(load_cell_2_samples) > 0) {
+            id(load_cell_2_offset) /= id(load_cell_2_samples);
+          }
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+globals:
+  - id: load_cell_1_offset
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: load_cell_2_offset
+    type: float
+    restore_value: false
+    initial_value: "0"
+  - id: load_cell_1_samples
+    type: int
+    restore_value: false
+    initial_value: "0"
+  - id: load_cell_2_samples
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+# Enables logging over the serial console (and, once connected, over WiFi).
+logger:
+
+# Native Home Assistant API - this is what makes Home Assistant auto-discover
+# the device via mDNS once it's on the network (Settings > Devices & Services).
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+# Lets you push firmware updates over WiFi after the first serial flash.
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Falls back to a hotspot named like "Esp32-Sensorstation Fallback" if it
+  # can't join the configured WiFi - connect to that to reconfigure.
+  ap:
+    ssid: "ESP32 Sensor Station Fallback"
+
+captive_portal:
+
+i2c:
+  sda: GPIO21
+  scl: GPIO22
+  frequency: 50kHz
+  scan: true
+
+sensor:
+  - platform: aht10
+    variant: AHT20
+    temperature:
+      name: "Temperature"
+    humidity:
+      name: "Humidity"
+    update_interval: 180s
+
+  - platform: bmp280_i2c
+    address: 0x77
+    temperature:
+      name: "BMP280 Temperature"
+    pressure:
+      name: "Pressure"
+    iir_filter: 16x
+    update_interval: 180s
+
+  # Calibrated using the DELTA between unloaded and loaded (238g) readings,
+  # not absolute values - the on_boot logic above re-zeros each cell at
+  # startup (subtracting the offset global), so only the span (how much the
+  # reading moves per gram) needs to stay fixed; the absolute zero point is
+  # re-established every boot. These delta numbers match the original
+  # Arduino-derived raw deltas (90288 / -91436) - an earlier attempt to
+  # re-measure the delta directly under ESPHome caught a premature/unsettled
+  # reading and was off by ~100x; the true raw scale matches the old numbers.
+  - platform: hx711
+    id: load_cell_1
+    name: "Load Cell 1"
+    dout_pin: GPIO16
+    clk_pin: GPIO17
+    update_interval: 250ms
+    unit_of_measurement: "g"
+    accuracy_decimals: 1
+    filters:
+      - lambda: return x - id(load_cell_1_offset);
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 2
+      - calibrate_linear:
+          - 0 -> 0
+          - 90288 -> 238
+      - throttle: 30s
+
+  - platform: hx711
+    id: load_cell_2
+    name: "Load Cell 2"
+    dout_pin: GPIO4
+    clk_pin: GPIO27
+    update_interval: 250ms
+    unit_of_measurement: "g"
+    accuracy_decimals: 1
+    filters:
+      - lambda: return x - id(load_cell_2_offset);
+      - sliding_window_moving_average:
+          window_size: 10
+          send_every: 2
+      - calibrate_linear:
+          - 0 -> 0
+          - -91436 -> 238
+      - throttle: 30s
