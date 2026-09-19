@@ -20,22 +20,6 @@ external component.
 The `esphome` CLI runs from a local Python venv (`.venv/`, gitignored) —
 `python3 -m venv .venv && .venv/bin/pip install esphome`.
 
-## Repo layout
-
-```
-esp32-screensensor.yaml   # main device config — the actual project (this screen node)
-esp32-sensorstation.yaml  # companion device config — kitchen_esp32_weight_sensor_station
-secrets.yaml              # WiFi/API/OTA secrets — see Secrets section (gitignored)
-components/
-└── uc8253_epaper/        # custom external component (display driver)
-    ├── display.py
-    ├── uc8253_epaper.h
-    └── uc8253_epaper.cpp
-```
-
-`esp32-sensorstation.yaml` targets a separate physical ESP32 — flash/OTA/logs
-commands need to name it explicitly (`esphome run esp32-sensorstation.yaml`).
-
 ## Build / flash / logs
 
 Run against whichever device's YAML file you're targeting
@@ -88,7 +72,7 @@ and checking the rendered display / HA logs.
 
 ## TODO
 
-- [ ] Replace the placeholder OTA password (`"changeme"` in
+- [ ] Replace the placeholder OTA password (in
       `secrets.yaml`) with a real secret.
 - [ ] Reconsider MQTT for the load-cell weight readings (esp32-sensorstation
       publishing, esp32-screensensor subscribing directly) instead of the
