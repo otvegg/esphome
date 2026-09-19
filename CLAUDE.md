@@ -1,14 +1,19 @@
-# esp32-screen-sensor
+# esphome
 
 ## Overview
 
-An ESPHome-based ESP32 that drives a WeAct Studio 3.7" e-paper display as a Home
-Assistant status dashboard. It's a "screen" node, not really a raw sensor node: it
-mostly renders data pulled *from* Home Assistant (indoor temperature, weather
-forecast, load-cell threshold counts from a companion device), plus a couple of
-its own local sensors, onto the e-paper panel. How often it actually redraws,
-and when it goes quiet overnight, are both adjustable live from Home
+A small collection of ESPHome-based ESP32 devices for the smarthome. The main
+one drives a WeAct Studio 3.7" e-paper display as a Home Assistant status
+dashboard — a "screen" node, not really a raw sensor node: it mostly renders
+data pulled *from* Home Assistant (indoor temperature, weather forecast,
+load-cell threshold counts from a companion device), plus a couple of its own
+local sensors, onto the e-paper panel. How often it actually redraws, and
+when it goes quiet overnight, are both adjustable live from Home
 Assistant — see Data flow / integrations below.
+
+The companion device, `esp32-sensorstation.yaml`, is a separate physical
+ESP32 (a kitchen load-cell weight sensor station) kept in this same repo for
+convenience — see Repo layout below.
 
 ## Project type & tooling
 

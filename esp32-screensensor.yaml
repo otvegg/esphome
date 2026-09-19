@@ -1,6 +1,6 @@
 esphome:
   name: esp32-screensensor
-  friendly_name: "ESP32 Screen Sensor Statiob"
+  friendly_name: "ESP32 Screen Sensor Station"
   # GPIO2 has an onboard pull-up (needed for boot-mode strapping) and this
   # board's onboard blue LED lights whenever GPIO2 is high, so it's lit at
   # idle even with nothing wired to it. Safe to drive low once boot has
@@ -78,8 +78,6 @@ time:
           - lambda: |-
               id(cell1_above_count) = 0;
               id(cell2_above_count) = 0;
-              id(min_temp_today) = 100.0;
-              id(max_temp_today) = -100.0;
 
 globals:
   - id: cell1_above_count
@@ -90,17 +88,6 @@ globals:
     type: int
     restore_value: true
     initial_value: '0'
-  # Sentinels chosen so the first real reading of the day immediately
-  # overwrites them in the right direction - no real temperature reads
-  # anywhere near +-100 C.
-  - id: min_temp_today
-    type: float
-    restore_value: true
-    initial_value: '100.0'
-  - id: max_temp_today
-    type: float
-    restore_value: true
-    initial_value: '-100.0'
   # millis() timestamp of the last value received from Home Assistant (any
   # of the push-based sensors below) - used to show a staleness warning if
   # the API connection or HA itself has gone quiet.
@@ -147,20 +134,6 @@ font:
     size: 16
 
 sensor:
-  - platform: homeassistant
-    id: my_sensor
-    entity_id: sensor.kitchen_esp32_weight_sensor_station_temperature
-    filters:
-      - delta: 0.5  # ignore fluctuations smaller than this - pairs with the
-                    # display's own skip-if-unchanged refresh logic to avoid
-                    # needless e-paper flicker for tiny temperature wobbles
-    on_value:
-      then:
-        - lambda: |-
-            id(last_ha_update_ms) = millis();
-            if (x < id(min_temp_today)) id(min_temp_today) = x;
-            if (x > id(max_temp_today)) id(max_temp_today) = x;
-
   # Met.no/Yr.no forecast, via HA's built-in Met.no integration.
   - platform: homeassistant
     id: outdoor_temp
@@ -260,9 +233,26 @@ text_sensor:
 
 graph:
   - id: temp_graph
-    sensor: my_sensor
-    duration: 8h
+    sensor: aht20_temperature
+    duration: 4h
     width: 200
+    height: 70
+    x_grid: 1h
+
+  # Weight graph, next to the temperature one - both cells on the same axes
+  # (line_type differentiates them since the panel is monochrome, so color
+  # can't). Purely visual/trend context; the actual >500g counting still
+  # happens via the on_value rising-edge lambdas above, not this graph.
+  - id: weight_graph
+    traces:
+      - sensor: cell1_weight
+        line_type: SOLID
+        line_thickness: 2
+      - sensor: cell2_weight
+        line_type: DASHED
+        line_thickness: 2
+    duration: 8h
+    width: 160
     height: 70
     x_grid: 1h
 
@@ -323,8 +313,8 @@ display:
       bool quiet_hours = false;
       if (now.is_valid()) {
         const int minutes_since_midnight = now.hour * 60 + now.minute;
-        const int start_min = id(quiet_hours_start).hour() * 60 + id(quiet_hours_start).minute();
-        const int end_min = id(quiet_hours_end).hour() * 60 + id(quiet_hours_end).minute();
+        const int start_min = id(quiet_hours_start).hour * 60 + id(quiet_hours_start).minute;
+        const int end_min = id(quiet_hours_end).hour * 60 + id(quiet_hours_end).minute;
         // Handles a window that crosses midnight (e.g. 23:00 -> 06:00) as
         // well as one that doesn't (e.g. 02:00 -> 05:30) - both are
         // reasonable choices once this is user-configurable from HA.
@@ -359,6 +349,17 @@ display:
         }
       }
 
+      // Don't let the very first post-boot draw "lock in" while the AHT20
+      // hasn't reported yet (it takes a little while after boot) - otherwise
+      // that one draw bakes NaN into the printed temperature/humidity line
+      // and then freezes there for a full update_interval_minutes, since
+      // first_draw_done would already be true. Keep retrying every poll tick
+      // (the display's own 60s update_interval) until a real reading shows
+      // up, then treat that as the real first draw.
+      if (!id(first_draw_done) && std::isnan(id(aht20_temperature).state)) {
+        return;
+      }
+
       id(first_draw_done) = true;
       id(last_draw_ms) = millis();
 
@@ -371,9 +372,20 @@ display:
       it.rectangle(0, 0, it.get_width(), it.get_height());
 
       // Header: uptime (left), title (center), WiFi signal bars (right) -
-      // all sharing one row, no extra vertical space needed.
+      // all sharing one row, no extra vertical space needed. During the one
+      // frame drawn as quiet hours begin, the title is swapped for the
+      // freeze notice instead, front and center at the very top - this is
+      // the one frame anyone will actually see before the screen freezes for
+      // the night, so it's the most visible spot rather than tucked away
+      // next to a graph.
       it.print(6, 8, id(font2), id(uptime_human).state.c_str());
-      it.print(it.get_width() / 2, 4, id(font1), TextAlign::TOP_CENTER, "Screensensor Station");
+      if (quiet_hours) {
+        it.filled_circle(it.get_width() / 2 - 34, 12, 10);
+        it.filled_circle(it.get_width() / 2 - 29, 8, 10, Color::BLACK);  // carves a crescent out of the circle above
+        it.printf(it.get_width() / 2 - 16, 4, id(font2), "Frozen %02d:%02d", now.hour, now.minute);
+      } else {
+        it.print(it.get_width() / 2, 4, id(font1), TextAlign::TOP_CENTER, "Vaer & Vekt");
+      }
       {
         // 4-bar signal indicator instead of a raw dBm number - drawn with
         // rectangles rather than relying on a font glyph for it.
@@ -398,10 +410,9 @@ display:
       // on this monochrome panel, Color::is_on() (not the RGB value) decides
       // ink vs blank, so Color::BLACK renders invisible. Omitting it defaults
       // to COLOR_ON, which is correct.
-      it.printf(10, 34, id(font2), "HA: %.1fC | mn %.1f | mx %.1f", id(my_sensor).state, id(min_temp_today), id(max_temp_today));
-      it.printf(10, 52, id(font2), "AHT20:    %.1f C  %.0f%% RH", id(aht20_temperature).state, id(aht20_humidity).state);
-      it.printf(10, 70, id(font2), "BMP280:   %.1f C  %.1f hPa", id(bmp280_temperature).state, id(bmp280_pressure).state);
-      it.printf(10, 88, id(font2), "Outdoor:  %s %.1f C", id(outdoor_condition).state.c_str(), id(outdoor_temp).state);
+      it.printf(10, 34, id(font2), "AHT20:    %.1f C  %.0f%% RH", id(aht20_temperature).state, id(aht20_humidity).state);
+      it.printf(10, 52, id(font2), "BMP280:   %.1f C  %.1f hPa", id(bmp280_temperature).state, id(bmp280_pressure).state);
+      it.printf(10, 70, id(font2), "Outdoor:  %s %.1f C", id(outdoor_condition).state.c_str(), id(outdoor_temp).state);
 
       // Load cell threshold counts, separated from the sensor readings by a
       // vertical divider. Each counts distinct crossings above 500g today,
@@ -414,11 +425,19 @@ display:
 
       // 3-day forecast, where the WiFi/uptime status line used to be -
       // condition text is capped to 5 chars (%.5s) so a long condition
-      // string (e.g. "partlycloudy") can't blow out the line width.
-      it.printf(10, 114, id(font2), "1: %.0fC %.5s | 2: %.0fC %.5s | 3: %.0fC %.5s",
-                id(forecast_day_1_temp).state, id(forecast_day_1_condition).state.c_str(),
-                id(forecast_day_2_temp).state, id(forecast_day_2_condition).state.c_str(),
-                id(forecast_day_3_temp).state, id(forecast_day_3_condition).state.c_str());
+      // string (e.g. "partlycloudy") can't blow out the line width. Labeled
+      // with the actual weekday abbreviation (tomorrow, day after, etc.)
+      // instead of "1/2/3" - day_of_week is 1=Sunday..7=Saturday per
+      // ESPHome's ESPTime, so index (day_of_week - 1 + offset) % 7 into the
+      // array below. Falls back to "?" if time isn't synced yet.
+      static const char *const WEEKDAYS[7] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+      const char *day1_name = now.is_valid() ? WEEKDAYS[(now.day_of_week - 1 + 1) % 7] : "?";
+      const char *day2_name = now.is_valid() ? WEEKDAYS[(now.day_of_week - 1 + 2) % 7] : "?";
+      const char *day3_name = now.is_valid() ? WEEKDAYS[(now.day_of_week - 1 + 3) % 7] : "?";
+      it.printf(10, 114, id(font2), "%s: %.0fC %.5s | %s: %.0fC %.5s | %s: %.0fC %.5s",
+                day1_name, id(forecast_day_1_temp).state, id(forecast_day_1_condition).state.c_str(),
+                day2_name, id(forecast_day_2_temp).state, id(forecast_day_2_condition).state.c_str(),
+                day3_name, id(forecast_day_3_temp).state, id(forecast_day_3_condition).state.c_str());
 
       // Staleness warning - only appears if nothing has arrived from Home
       // Assistant in a while (catches HA being down or the API connection
@@ -429,17 +448,20 @@ display:
       }
       it.horizontal_line(4, 150, it.get_width() - 8);
 
-      // Graph, boxed in its own border. No legend - it only ever plots one
-      // series, so a legend would just be clutter.
+      // Temperature graph, boxed in its own border. No legend - it only
+      // ever plots one series, so a legend would just be clutter.
       it.rectangle(9, 156, 202, 76);
       it.graph(10, 157, id(temp_graph));
 
-      // Quiet-hours notice, drawn only on tonight's freezing frame (see the
-      // night_notice_drawn check above) - lives to the right of the graph,
-      // which only uses the left ~210px of this rotated panel's 416px width.
-      if (quiet_hours) {
-        it.filled_circle(240, 176, 12);
-        it.filled_circle(246, 172, 12, Color::BLACK);  // carves a crescent out of the circle above
-        it.print(225, 196, id(font2), "Quiet hours");
-        it.printf(225, 214, id(font2), "Frozen %02d:%02d", now.hour, now.minute);
+      // Weight graph, right next to it - narrower than the temp graph to
+      // leave room for a small legend to its right (two traces need one,
+      // unlike the single-series temp graph). Legend line samples are
+      // vertically centered against their own label text.
+      it.rectangle(219, 156, 140, 76);
+      it.graph(220, 157, id(weight_graph));
+      it.horizontal_line(364, 178, 12);
+      it.print(380, 172, id(font2), "Cell1");
+      for (int x = 364; x < 376; x += 3) {
+        it.horizontal_line(x, 210, 2);
       }
+      it.print(380, 204, id(font2), "Cell2");
