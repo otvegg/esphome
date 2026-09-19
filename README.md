@@ -38,11 +38,15 @@ commands need to name it explicitly (`esphome run esp32-sensorstation.yaml`).
 
 ## Build / flash / logs
 
+Run against whichever device's YAML file you're targeting
+(`esp32-screensensor.yaml` or `esp32-sensorstation.yaml`):
+
 ```
-esphome run esp32-screensensor.yaml     # compile + flash
-esphome compile esp32-screensensor.yaml
-esphome upload esp32-screensensor.yaml  # OTA upload
-esphome logs esp32-screensensor.yaml
+esphome run <file>.yaml       # compile + flash (asks serial vs. OTA)
+esphome compile <file>.yaml   # compile only, no flashing
+esphome upload <file>.yaml    # flash over OTA (device must already be on WiFi)
+esphome logs <file>.yaml      # attach to the running device's log stream only —
+                               # does not compile or flash anything
 ```
 
 ## Hardware notes
