@@ -125,6 +125,10 @@ font:
       weight: bold
     id: font1
     size: 20
+    # Default gfonts glyphset (GF_Latin_Kernel) doesn't include Norwegian
+    # æøå/ÆØÅ - added explicitly so the title can use the real spelling.
+    glyphs:
+      - "æøåÆØÅ"
 
   - file:
       type: gfonts
@@ -132,6 +136,14 @@ font:
       weight: bold
     id: font2
     size: 16
+
+  # Small axis-label font for the graphs (duration ticks, y-axis min/max) -
+  # regular weight instead of bold since bold blobs together at this size.
+  - file:
+      type: gfonts
+      family: Roboto
+    id: font3
+    size: 10
 
 sensor:
   # Met.no/Yr.no forecast, via HA's built-in Met.no integration.
@@ -180,6 +192,15 @@ sensor:
     pressure:
       name: "BMP280 Pressure"
       id: bmp280_pressure
+      # BMP280 reports raw station pressure, not sea-level (QNH) pressure like
+      # Yr/METAR report - the two aren't comparable without correcting for
+      # altitude. This house sits ~59m above sea level, which works out to
+      # about +6.8 hPa via the standard barometric formula at ~21C - close to
+      # the ~6.5 hPa gap observed against Yr. A fixed offset isn't perfectly
+      # exact (the real correction has a small temperature dependence), but
+      # it's within noise for a status display.
+      filters:
+        - offset: 6.8
 
 
   # Raw load cell readings, pulled just to detect threshold crossings below -
@@ -235,8 +256,14 @@ graph:
   - id: temp_graph
     sensor: aht20_temperature
     duration: 4h
-    width: 200
-    height: 70
+    # 16px narrower than the box's full interior width - leaves a gutter to
+    # the box's left for the y-axis min/max labels, drawn outside the plot
+    # area instead of overlapping the curve.
+    width: 184
+    # 6px shorter than the box's full interior height - leaves room below
+    # the box for the duration-tick labels, drawn outside the plot area
+    # instead of overlapping the curve.
+    height: 64
     x_grid: 1h
 
   # Weight graph, next to the temperature one - both cells on the same axes
@@ -252,9 +279,11 @@ graph:
         line_type: DASHED
         line_thickness: 2
     duration: 8h
-    width: 160
-    height: 70
-    x_grid: 1h
+    # Also narrower/shorter than its box, same reasons as temp_graph above -
+    # gutter to the left for y-axis min/max, room below for duration ticks.
+    width: 144
+    height: 64
+    x_grid: 2h
 
 # Settings adjustable from Home Assistant without re-flashing. All three are
 # pure "template" entities (no lambda/set_action) so HA's set command is the
@@ -384,7 +413,7 @@ display:
         it.filled_circle(it.get_width() / 2 - 29, 8, 10, Color::BLACK);  // carves a crescent out of the circle above
         it.printf(it.get_width() / 2 - 16, 4, id(font2), "Frozen %02d:%02d", now.hour, now.minute);
       } else {
-        it.print(it.get_width() / 2, 4, id(font1), TextAlign::TOP_CENTER, "Vaer & Vekt");
+        it.print(it.get_width() / 2, 4, id(font1), TextAlign::TOP_CENTER, "Vær & Vekt");
       }
       {
         // 4-bar signal indicator instead of a raw dBm number - drawn with
@@ -448,17 +477,53 @@ display:
       }
       it.horizontal_line(4, 150, it.get_width() - 8);
 
-      // Temperature graph, boxed in its own border. No legend - it only
-      // ever plots one series, so a legend would just be clutter.
-      it.rectangle(9, 156, 202, 76);
-      it.graph(10, 157, id(temp_graph));
+      // Duration tick labels along a graph's bottom edge (e.g. "4t 3t 2t 1t
+      // 0t" for a 4h graph with 1h steps) - drawn in-box, near the bottom
+      // border, since there's no spare vertical space below the graph boxes
+      // to put them outside. step_hours must match that graph's own x_grid
+      // so the text lines up with the dotted gridlines the graph component
+      // itself draws.
+      auto draw_duration_ticks = [&it](int x, int y, int w, int duration_hours, int step_hours) {
+        const int n = duration_hours / step_hours;
+        for (int i = 0; i <= n; i++) {
+          char buf[6];
+          snprintf(buf, sizeof(buf), "%dt", duration_hours - i * step_hours);
+          const int tx = x + i * (w - 1) / n;
+          if (i == 0) {
+            it.print(tx, y, id(font3), TextAlign::TOP_LEFT, buf);
+          } else if (i == n) {
+            it.print(tx, y, id(font3), TextAlign::TOP_RIGHT, buf);
+          } else {
+            it.print(tx, y, id(font3), TextAlign::TOP_CENTER, buf);
+          }
+        }
+      };
 
-      // Weight graph, right next to it - narrower than the temp graph to
-      // leave room for a small legend to its right (two traces need one,
-      // unlike the single-series temp graph). Legend line samples are
-      // vertically centered against their own label text.
-      it.rectangle(219, 156, 140, 76);
-      it.graph(220, 157, id(weight_graph));
+      // Temperature graph, boxed in its own border, shifted right 16px and
+      // shortened 6px from where the box would otherwise be - that reserves
+      // a gutter to its left for the y-axis min/max labels, and a strip
+      // below for the duration-tick labels, both drawn outside the plot
+      // area instead of sitting on top of the curve. No trace legend - it
+      // only ever plots one series, so a legend would just be clutter.
+      it.rectangle(25, 156, 186, 70);
+      it.graph(26, 157, id(temp_graph));
+      // get_graph_limit_max()/min() are only populated once draw() (called
+      // above via it.graph()) has run, so these reads must come after it -
+      // otherwise they'd show the previous redraw's range instead of this
+      // one's.
+      it.printf(10, 158, id(font3), "%.0f", id(temp_graph).get_graph_limit_max());
+      it.printf(10, 214, id(font3), "%.0f", id(temp_graph).get_graph_limit_min());
+      draw_duration_ticks(26, 227, 184, 4, 1);
+
+      // Weight graph, right next to it - same left-gutter/below-strip
+      // layout as the temp graph, plus a small legend to its right (two
+      // traces need one, unlike the single-series temp graph). Legend line
+      // samples are vertically centered against their own label text.
+      it.rectangle(235, 156, 124, 70);
+      it.graph(236, 157, id(weight_graph));
+      it.printf(220, 158, id(font3), "%.0f", id(weight_graph).get_graph_limit_max());
+      it.printf(220, 214, id(font3), "%.0f", id(weight_graph).get_graph_limit_min());
+      draw_duration_ticks(236, 227, 144, 8, 2);
       it.horizontal_line(364, 178, 12);
       it.print(380, 172, id(font2), "Cell1");
       for (int x = 364; x < 376; x += 3) {
