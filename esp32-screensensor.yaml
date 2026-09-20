@@ -126,7 +126,15 @@ font:
     id: font1
     size: 20
     # Default gfonts glyphset (GF_Latin_Kernel) doesn't include Norwegian
-    # æøå/ÆØÅ - added explicitly so the title can use the real spelling.
+    # æøå/ÆØÅ, so it's added explicitly via `glyphs:` below. But ESPHome only
+    # auto-includes the default glyphset when *both* glyphs and glyphsets are
+    # left unset - specifying `glyphs:` alone replaces the whole default set
+    # instead of extending it, which left every other character (letters,
+    # spaces, "&") with no glyph data at all (rendered as boxes). Declaring
+    # `glyphsets:` here too restores the normal Latin coverage alongside the
+    # extra Norwegian letters.
+    glyphsets:
+      - GF_Latin_Kernel
     glyphs:
       - "æøåÆØÅ"
 
